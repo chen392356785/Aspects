@@ -19,6 +19,8 @@ typedef NS_OPTIONS(int, AspectBlockFlags) {
 	AspectBlockFlagsHasCopyDisposeHelpers = (1 << 25),
 	AspectBlockFlagsHasSignature          = (1 << 30)
 };
+
+/// 充当内部 Block
 typedef struct _AspectBlock {
 	__unused Class isa;
 	AspectBlockFlags flags;
@@ -37,13 +39,22 @@ typedef struct _AspectBlock {
 	// imported variables
 } *AspectBlockRef;
 
+// __unused 宏定义实际上是 __attribute__((unused)) GCC 定语，旨在告诉编译器“如果我没有在后面使用到这个变量也别警告我”。
+
+// AspectInfo 在这里是一个 Class，其遵守上文中讲到的 AspectInfo 协议，不要混淆。
+/// 切面信息，遵循 AspectInfo 协议
 @interface AspectInfo : NSObject <AspectInfo>
+
 - (id)initWithInstance:(__unsafe_unretained id)instance invocation:(NSInvocation *)invocation;
 @property (nonatomic, unsafe_unretained, readonly) id instance;
 @property (nonatomic, strong, readonly) NSArray *arguments;
 @property (nonatomic, strong, readonly) NSInvocation *originalInvocation;
+
+// 关于装箱，对于提供一个 NSInvocation 就可以拿到其 arguments 这一点上，ReactiveCocoa 团队提供了很大贡献（细节见 Aspects 内部 NSInvocation 分类）。
+// AspectInfo 比较简单，参考 ReactiveCocoa 团队提供的 NSInvocation 参数通用方法可将参数装箱为 NSValue，简单来说 AspectInfo 扮演了一个提供 Hook 信息的角色。
 @end
 
+/// 切面 ID，应该遵循 AspectToken 协议（作者漏掉了，已提 PR）
 // Tracks a single aspect.
 @interface AspectIdentifier : NSObject
 + (instancetype)identifierWithSelector:(SEL)selector object:(id)object options:(AspectOptions)options block:(id)block error:(NSError **)error;
@@ -53,18 +64,27 @@ typedef struct _AspectBlock {
 @property (nonatomic, strong) NSMethodSignature *blockSignature;
 @property (nonatomic, weak) id object;
 @property (nonatomic, assign) AspectOptions options;
+
+// AspectIdentifier 实际上是添加切面的 Block 的第一个参数，其应该遵循 AspectToken 协议，事实上也的确如此，其提供了 remove 方法的实现。
+// AspectIdentifier 内部需要注意的是由于使用 Block 来写 Hook 中我们加的料，这里生成了 blockSignature，在 AspectIdentifier 初始化的过程中会去判断 blockSignature 与入参 object 的 selector 得到的 methodSignature 的兼容性，兼容性判断成功才会顺利初始化。
 @end
 
+/// 切面容器
 // Tracks all aspects for an object/class.
 @interface AspectsContainer : NSObject
 - (void)addAspect:(AspectIdentifier *)aspect withOptions:(AspectOptions)injectPosition;
 - (BOOL)removeAspect:(id)aspect;
 - (BOOL)hasAspects;
-@property (atomic, copy) NSArray *beforeAspects;
-@property (atomic, copy) NSArray *insteadAspects;
-@property (atomic, copy) NSArray *afterAspects;
+@property (atomic, copy) NSArray *beforeAspects;        // AspectPositionBefore
+@property (atomic, copy) NSArray *insteadAspects;       // AspectPositionInstead
+@property (atomic, copy) NSArray *afterAspects;         // AspectPositionAfter
+
+// AspectsContainer 作为切面的容器类，关联指定对象的指定方法，内部有三个切面队列，分别容纳关联指定对象的指定方法中相对应 AspectOption 的 Hook
+// 因为 AspectsContainer 是在 NSObject 分类中通过 AssociatedObject 方法与当前要 Hook 的目标关联在一起的。
+// 关联目标是 Hook 之后的 Selector，即 aliasSelector（原始 SEL 名称加 aspects_ 前缀对应的 SEL）。
 @end
 
+/// 切面跟踪器
 @interface AspectTracker : NSObject
 - (id)initWithTrackedClass:(Class)trackedClass;
 @property (nonatomic, strong) Class trackedClass;
@@ -75,6 +95,8 @@ typedef struct _AspectBlock {
 - (void)removeSubclassTracker:(AspectTracker *)subclassTracker hookingSelectorName:(NSString *)selectorName;
 - (BOOL)subclassHasHookedSelectorName:(NSString *)selectorName;
 - (NSSet *)subclassTrackersHookingSelectorName:(NSString *)selectorName;
+
+// AspectTracker 是从下而上追踪，最底层的 parentEntry 为 nil，父类的 parentEntry 为子类的 tracker。
 @end
 
 @interface NSInvocation (Aspects)
@@ -348,54 +370,84 @@ static void aspect_cleanupHookedClassAndSelector(NSObject *self, SEL selector) {
 #pragma mark - Hook Class
 
 static Class aspect_hookClass(NSObject *self, NSError **error) {
+    // 断言 self
     NSCParameterAssert(self);
+    // class
 	Class statedClass = self.class;
+    // isa(meta-class)???
 	Class baseClass = object_getClass(self);
 	NSString *className = NSStringFromClass(baseClass);
 
-    // Already subclassed
+    // 已经子类化过了
 	if ([className hasSuffix:AspectsSubclassSuffix]) {
 		return baseClass;
 
-        // We swizzle a class object, not a single object.
+        // 我们混写了一个 class 对象，而非一个单独的 object
 	}else if (class_isMetaClass(baseClass)) {
+        // baseClass 是元类，则 self 是 Class 或 MetaClass，混写 self
         return aspect_swizzleClassInPlace((Class)self);
-        // Probably a KVO'ed class. Swizzle in place. Also swizzle meta classes in place.
+        // 可能是一个 KVO'ed class。混写就位。也要混写 meta classes。
     }else if (statedClass != baseClass) {
+        // 当 .class 和 isa 指向不同的情况，混写 baseClass
         return aspect_swizzleClassInPlace(baseClass);
     }
 
-    // Default case. Create dynamic subclass.
+    // 默认情况下，动态创建子类
+    // 拼接子类后缀 AspectsSubclassSuffix
 	const char *subclassName = [className stringByAppendingString:AspectsSubclassSuffix].UTF8String;
+    // 尝试用拼接后缀的名称获取 isa
 	Class subclass = objc_getClass(subclassName);
 
+    // 找不到 isa，代表还没有动态创建过这个子类
 	if (subclass == nil) {
+        // 创建一个 class pair，baseClass 作为新类的 superClass，类名为 subclassName
 		subclass = objc_allocateClassPair(baseClass, subclassName, 0);
-		if (subclass == nil) {
+		if (subclass == nil) { // 返回 nil，即创建失败
             NSString *errrorDesc = [NSString stringWithFormat:@"objc_allocateClassPair failed to allocate class %s.", subclassName];
             AspectError(AspectErrorFailedToAllocateClassPair, errrorDesc);
             return nil;
         }
 
+        // 混写 forwardInvocation:
 		aspect_swizzleForwardInvocation(subclass);
+        // subClass.class = statedClass
 		aspect_hookedGetClass(subclass, statedClass);
+        // subClass.isa.class = statedClass
 		aspect_hookedGetClass(object_getClass(subclass), statedClass);
+        // 注册新类
 		objc_registerClassPair(subclass);
 	}
 
+    // 覆盖 isa
 	object_setClass(self, subclass);
 	return subclass;
+    
+    // 1.其实这里的难点就在于对 .class 和 object_getClass 的区分。
+    // .class 当 target 是 Instance 则返回 Class，当 target 是 Class 则返回自身
+    // object_getClass 返回 isa 指针的指向
+    
+    // 2.动态创建一个 Class 的完整步骤也是我们应该注意的。
+    //    objc_allocateClassPair
+    //    class_addMethod
+    //    class_addIvar
+    //    objc_registerClassPair
 }
 
 static NSString *const AspectsForwardInvocationSelectorName = @"__aspects_forwardInvocation:";
 static void aspect_swizzleForwardInvocation(Class klass) {
+    // 断言 klass
     NSCParameterAssert(klass);
-    // If there is no method, replace will act like class_addMethod.
+    // 如果没有 method，replace 实际上会像是 class_addMethod 一样
     IMP originalImplementation = class_replaceMethod(klass, @selector(forwardInvocation:), (IMP)__ASPECTS_ARE_BEING_CALLED__, "v@:@");
+    // 拿到 originalImplementation 证明是 replace 而不是 add，情况少见
     if (originalImplementation) {
+        // 添加 AspectsForwardInvocationSelectorName 的方法，IMP 为原生 forwardInvocation:
         class_addMethod(klass, NSSelectorFromString(AspectsForwardInvocationSelectorName), originalImplementation, "v@:@");
     }
     AspectLog(@"Aspects: %@ is now aspect aware.", NSStringFromClass(klass));
+    
+    // 把要 Hook 的目标 Class 的 forwardInvocation: 混写了，混写之后 forwardInvocation: 的具体实现在 __ASPECTS_ARE_BEING_CALLED__ 中，
+    // 里面能看到 invoke 标识位的不同是如何实现的，还有一些其他的实现细节
 }
 
 static void aspect_undoSwizzleForwardInvocation(Class klass) {
@@ -421,9 +473,12 @@ static void aspect_hookedGetClass(Class class, Class statedClass) {
 
 ///////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark - Swizzle Class In Place
-
+// 修改这个全局变量内容的方法
 static void _aspect_modifySwizzledClasses(void (^block)(NSMutableSet *swizzledClasses)) {
+    // 在 Aspects 中担当记录已混写类的角色，其内部结构如下：<NSStringFromClass(Class)>
+    // 这个全局变量记录了 forwardInvocation: 被混写的的类名称。
     static NSMutableSet *swizzledClasses;
+    
     static dispatch_once_t pred;
     dispatch_once(&pred, ^{
         swizzledClasses = [NSMutableSet new];
@@ -461,7 +516,7 @@ static void aspect_undoSwizzleClassInPlace(Class klass) {
 ///////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark - Aspect Invoke Point
 
-// This is a macro so we get a cleaner stack trace.
+// 宏定义，以便于我们有一个更明晰的 stack trace
 #define aspect_invoke(aspects, info) \
 for (AspectIdentifier *aspect in aspects) {\
     [aspect invokeWithInfo:info];\
@@ -472,12 +527,19 @@ for (AspectIdentifier *aspect in aspects) {\
 
 // This is the swizzled forwardInvocation: method.
 static void __ASPECTS_ARE_BEING_CALLED__(__unsafe_unretained NSObject *self, SEL selector, NSInvocation *invocation) {
+    // __unsafe_unretained NSObject *self 不解释了
+    // 断言 self, invocation
     NSCParameterAssert(self);
     NSCParameterAssert(invocation);
+    // 从 invocation 可以拿到很多东西，比如 originalSelector
     SEL originalSelector = invocation.selector;
+    // originalSelector 加前缀得到 aliasSelector
 	SEL aliasSelector = aspect_aliasForSelector(invocation.selector);
+    // 用 aliasSelector 替换 invocation.selector
     invocation.selector = aliasSelector;
+    // Instance 的容器
     AspectsContainer *objectContainer = objc_getAssociatedObject(self, aliasSelector);
+    // Class 的容器
     AspectsContainer *classContainer = aspect_getContainerForClass(object_getClass(self), aliasSelector);
     AspectInfo *info = [[AspectInfo alloc] initWithInstance:self invocation:invocation];
     NSArray *aspectsToRemove = nil;
@@ -489,9 +551,12 @@ static void __ASPECTS_ARE_BEING_CALLED__(__unsafe_unretained NSObject *self, SEL
     // Instead hooks.
     BOOL respondsToAlias = YES;
     if (objectContainer.insteadAspects.count || classContainer.insteadAspects.count) {
+        // 如果有任何 insteadAspects 就直接替换了
         aspect_invoke(classContainer.insteadAspects, info);
         aspect_invoke(objectContainer.insteadAspects, info);
     }else {
+        // 否则正常执行
+        // 遍历 invocation.target 及其 superClass 找到实例可以响应 aliasSelector 的点 invoke
         Class klass = object_getClass(invocation.target);
         do {
             if ((respondsToAlias = [klass instancesRespondToSelector:aliasSelector])) {
@@ -505,10 +570,11 @@ static void __ASPECTS_ARE_BEING_CALLED__(__unsafe_unretained NSObject *self, SEL
     aspect_invoke(classContainer.afterAspects, info);
     aspect_invoke(objectContainer.afterAspects, info);
 
-    // If no hooks are installed, call original implementation (usually to throw an exception)
+    // 如果没有 hook，则执行原始实现（通常会抛出异常）
     if (!respondsToAlias) {
         invocation.selector = originalSelector;
         SEL originalForwardInvocationSEL = NSSelectorFromString(AspectsForwardInvocationSelectorName);
+        // 如果可以响应 originalForwardInvocationSEL，表示之前是 replace method 而非 add method
         if ([self respondsToSelector:originalForwardInvocationSEL]) {
             ((void( *)(id, SEL, NSInvocation *))objc_msgSend)(self, originalForwardInvocationSEL, invocation);
         }else {
@@ -516,8 +582,12 @@ static void __ASPECTS_ARE_BEING_CALLED__(__unsafe_unretained NSObject *self, SEL
         }
     }
 
-    // Remove any hooks that are queued for deregistration.
+    // 移除 aspectsToRemove 队列中的 AspectIdentifier，执行 remove
     [aspectsToRemove makeObjectsPerformSelector:@selector(remove)];
+    
+    // 代码实现对应了 Hook 的 AspectOptions 参数的 Before，Instead 和 After。
+    // aspect_invoke 中 aspectsToRemove 是一个 NSArray，里面容纳着需要被销户的 Hook，即 AspectIdentifier（之后会调用 remove 移除）。
+    // 遍历 invocation.target 及其 superClass 找到实例可以响应 aliasSelector 的点 invoke 实现代码。
 }
 #undef aspect_invoke
 
@@ -557,7 +627,10 @@ static void aspect_destroyContainerForObject(id<NSObject> self, SEL selector) {
 #pragma mark - Selector Blacklist Checking
 
 static NSMutableDictionary *aspect_getSwizzledClassesDict() {
+    // 在 Aspects 中扮演着已混写类字典的角色，其内部结构应该是这样的：<Class : AspectTracker *>
+    // 这个全局变量可以简单理解为记录整个 Hook 影响的 Class 包含其 SuperClass 的追踪记录的全局字典。
     static NSMutableDictionary *swizzledClassesDict;
+    
     static dispatch_once_t pred;
     dispatch_once(&pred, ^{
         swizzledClassesDict = [NSMutableDictionary new];
@@ -600,6 +673,7 @@ static BOOL aspect_isSelectorAllowedAndTrack(NSObject *self, SEL selector, Aspec
         NSMutableDictionary *swizzledClassesDict = aspect_getSwizzledClassesDict();
         Class currentClass = [self class];
 
+        // 你应该已经注意到了全局变量 swizzledClassesDict 中的 value 对应着 AspectTracker 指针。
         AspectTracker *tracker = swizzledClassesDict[currentClass];
         if ([tracker subclassHasHookedSelectorName:selectorName]) {
             NSSet *subclassTracker = [tracker subclassTrackersHookingSelectorName:selectorName];
@@ -827,28 +901,33 @@ static void aspect_deregisterTrackedSelector(id self, SEL selector) {
     return identifier;
 }
 
+// Aspects 让我们在指定 Class 或 Instance 的特定 Selector 执行时
+// 根据 AspectOptions 插入我们自己的 Block 做 Hook
+// 而这个 Block 内部有我们想要的有关于当前 Target 和 Selector 的信息
 - (BOOL)invokeWithInfo:(id<AspectInfo>)info {
     NSInvocation *blockInvocation = [NSInvocation invocationWithMethodSignature:self.blockSignature];
     NSInvocation *originalInvocation = info.originalInvocation;
     NSUInteger numberOfArguments = self.blockSignature.numberOfArguments;
 
-    // Be extra paranoid. We already check that on hook registration.
+    // 偏执。我们已经在 hook 注册的时候检查过了，（不过这里我们还要检查）。
     if (numberOfArguments > originalInvocation.methodSignature.numberOfArguments) {
         AspectLogError(@"Block has too many arguments. Not calling %@", info);
         return NO;
     }
 
-    // The `self` of the block will be the AspectInfo. Optional.
+    // block 的 `self` 将会是 AspectInfo。可选的。
     if (numberOfArguments > 1) {
         [blockInvocation setArgument:&info atIndex:1];
     }
     
+    // 遍历参数分配内存 argBuf 然后从 originalInvocation 取 argument 赋值给 blockInvocation
 	void *argBuf = NULL;
     for (NSUInteger idx = 2; idx < numberOfArguments; idx++) {
         const char *type = [originalInvocation.methodSignature getArgumentTypeAtIndex:idx];
 		NSUInteger argSize;
 		NSGetSizeAndAlignment(type, &argSize, NULL);
         
+        // reallocf 优点，如果创建内存失败会自动释放之前的内存，讲究
 		if (!(argBuf = reallocf(argBuf, argSize))) {
             AspectLogError(@"Failed to allocate memory for block invocation.");
 			return NO;
@@ -858,8 +937,10 @@ static void aspect_deregisterTrackedSelector(id self, SEL selector) {
 		[blockInvocation setArgument:argBuf atIndex:idx];
     }
     
+    // 执行
     [blockInvocation invokeWithTarget:self.block];
     
+    // 释放 argBuf
     if (argBuf != NULL) {
         free(argBuf);
     }

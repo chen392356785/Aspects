@@ -15,27 +15,32 @@ typedef NS_OPTIONS(NSUInteger, AspectOptions) {
     AspectOptionAutomaticRemoval = 1 << 3 /// Will remove the hook after the first execution.
 };
 
-/// Opaque Aspect Token that allows to deregister the hook.
+// AspectToken 协议旨在让使用者可以灵活的注销之前添加过的 Hook，内部规定遵守此协议的对象须实现 remove 方法。
+/// 用于注销 Hook
+/// 不透明的 Aspect Token，用于注销 Hook
 @protocol AspectToken <NSObject>
 
-/// Deregisters an aspect.
-/// @return YES if deregistration is successful, otherwise NO.
+/// 注销一个 aspect.
+/// @return YES 表示注销成功，否则返回 NO
 - (BOOL)remove;
 
 @end
 
-/// The AspectInfo protocol is the first parameter of our block syntax.
+// AspectInfo 协议旨在规范对一个切面，即 aspect 的 Hook 内部信息的纰漏，我们在 Hook 时添加切面的 Block 第一个参数就遵守此协议。
+/// 嵌入 Hook 中的 Block 首位参数
+/// AspectInfo 协议是我们块语法的第一个参数。
 @protocol AspectInfo <NSObject>
 
-/// The instance that is currently hooked.
+/// 当前被 Hook 的实例
 - (id)instance;
 
-/// The original invocation of the hooked method.
+/// 被 Hook 方法的原始 invocation
 - (NSInvocation *)originalInvocation;
 
-/// All method arguments, boxed. This is lazily evaluated.
+/// 所有方法参数（装箱之后的）惰性执行
 - (NSArray *)arguments;
 
+// 装箱是一个开销昂贵操作，所以用到再去执行。
 @end
 
 /**
